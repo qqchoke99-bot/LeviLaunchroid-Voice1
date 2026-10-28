@@ -26,6 +26,7 @@ import org.levimc.launcher.core.mods.inbuilt.overlay.InbuiltOverlayManager
 import org.levimc.launcher.preloader.PreloaderInput
 import org.levimc.launcher.settings.FeatureSettings
 import org.levimc.launcher.util.LauncherBackgroundController
+import org.levimc.launcher.voice.VoiceCaptureService
 import org.levimc.pojavcontrols.PojavControls
 import org.levimc.pojavcontrols.PojavControlsHost
 import java.io.File
@@ -35,6 +36,9 @@ class MinecraftActivity : MainActivity(), PojavControlsHost {
 
     companion object {
         private const val PRELOADER_DOCUMENT_REQUEST = 0x4C50
+
+        // Voice Chat Levi: runtime request code for the microphone.
+        private const val RECORD_AUDIO_REQUEST = 0x5643  // "VC"
     }
 
     private lateinit var gameManager: GamePackageManager
@@ -122,6 +126,10 @@ class MinecraftActivity : MainActivity(), PojavControlsHost {
         trace.mark("Native mod enable started")
         ModManager.enableLoadedMods()
         trace.mark("Native mod enable finished")
+
+        // Voice Chat Levi: the microphone lives on this side of the fence,
+        // because RECORD_AUDIO is checked against this app's uid, not the mod's.
+        ensureVoiceCapture()
         setLeviKeepRunningInBackground(FeatureSettings.getInstance().isForegroundServiceEnabled())
         trace.mark("Mojang MainActivity super.onCreate starting")
         try {
@@ -267,6 +275,42 @@ class MinecraftActivity : MainActivity(), PojavControlsHost {
             PreloaderInput.onDocumentResult(false, "", "", throwable.message ?: "Unable to import selected document")
         } finally {
             temporaryFile?.delete()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Voice Chat Levi
+    //
+    // The native mod listens on 127.0.0.1:24456 for 20 ms PCM16 frames. This
+    // side holds the permission and does the recording, because audioserver
+    // checks the uid of the process that opens the input stream.
+    // ------------------------------------------------------------------
+
+    private fun ensureVoiceCapture() {
+        when (VoiceCaptureService.permissionState(this)) {
+            "granted" -> VoiceCaptureService.start(this)
+            "not declared in the manifest" ->
+                android.util.Log.w("VoiceChatLevi", "this build does not declare RECORD_AUDIO")
+            else -> requestPermissions(
+                arrayOf(android.Manifest.permission.RECORD_AUDIO), RECORD_AUDIO_REQUEST
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == RECORD_AUDIO_REQUEST) {
+            val granted = grantResults.firstOrNull() ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            android.util.Log.i(
+                "VoiceChatLevi",
+                if (granted) "microphone granted" else "microphone refused"
+            )
+            if (granted) VoiceCaptureService.start(this)
         }
     }
 

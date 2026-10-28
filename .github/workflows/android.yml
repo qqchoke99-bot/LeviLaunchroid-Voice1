@@ -1,9 +1,18 @@
 name: Android CI
 
 on:
+  # A tag push publishes a release. workflow_dispatch builds and uploads the APK
+  # without touching releases, so it is safe to press while testing.
+  workflow_dispatch:
   push:
     tags:
       - '*'
+
+# softprops/action-gh-release creates or updates a release and asks GitHub to
+# generate its notes. Without this, the token is read-only and that step dies
+# with "Resource not accessible by integration".
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -115,7 +124,16 @@ jobs:
             "$APK_IN"
           echo "APK_OUT=$APK_OUT" >> $GITHUB_ENV
 
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-apk
+          path: "LeviLauncher-*.apk"
+          if-no-files-found: error
+
       - name: Publish GitHub Release
+        # Only on a tag. A manual run has already handed you the APK above.
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

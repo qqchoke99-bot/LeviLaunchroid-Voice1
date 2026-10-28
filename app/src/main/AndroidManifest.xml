@@ -28,6 +28,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"
         tools:ignore="ForegroundServicesPolicy" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Voice Chat Levi: microphone for proximity voice. Added by the voice patch. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"
         tools:ignore="RequestInstallPackagesPolicy" />
     <queries>
@@ -90,6 +92,10 @@
                 android:value="Keeps the user-started Minecraft runtime at foreground-process priority while the game activity is backgrounded." />
         </service>
 
+        <!-- Voice Chat Levi: microphone capture service. Added by the voice patch. -->
+        <service
+            android:name="org.levimc.launcher.voice.VoiceCaptureService"
+            android:exported="false" />
 
         <service
             android:name="org.levimc.launcher.core.news.LauncherNewsMessagingService"
@@ -214,8 +220,6 @@
             android:configChanges="fontScale|density|smallestScreenSize|screenSize|uiMode|screenLayout|orientation|navigation|keyboardHidden|keyboard|touchscreen|locale|mnc|mcc"
             android:exported="false"
             tools:ignore="DiscouragedApi" />
-
-
 
         <activity
             android:name="org.levimc.launcher.ui.activities.CurseForgeActivity"

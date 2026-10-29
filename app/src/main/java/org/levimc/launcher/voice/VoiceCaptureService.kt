@@ -183,6 +183,7 @@ class VoiceCaptureService : Service() {
         var sent = 0L
         var failed = 0L
         var exits = 0
+        var parkNoticeGiven = false
         var waitLogged = false
         var lastWaitLog = 0L
         var exitReason = "running flag cleared"
@@ -196,11 +197,17 @@ class VoiceCaptureService : Service() {
                     val connected = connect()
                     if (connected != null) {
                         socket = connected
+                        if (attempt > 0) {
+                            Log.i(TAG, "voice socket came up after ${attempt + 1} attempt(s)")
+                        }
                         break
                     }
                     attempt++
                     val now = System.currentTimeMillis()
-                    if (!waitLogged || now - lastWaitLog >= WAIT_LOG_INTERVAL_MS) {
+                    // A first miss is normal: the Activity starts this service
+                    // before the mod's enable hook runs. Only explain it after
+                    // three failed attempts.
+                    if (attempt >= 3 && (!waitLogged || now - lastWaitLog >= WAIT_LOG_INTERVAL_MS)) {
                         Log.i(
                             TAG,
                             "waiting for the mod to open its voice socket " +
@@ -219,11 +226,15 @@ class VoiceCaptureService : Service() {
 
                 // ---- 2. ask the mod whether it wants our audio ---------------
                 if (isStandingDown(link)) {
-                    Log.i(
-                        TAG,
-                        "the game reads the microphone directly; capture service parked " +
-                            "(released the mic, re-checking every ${PARKED_RECHECK_MS / 1000} s)"
-                    )
+                    if (!parkNoticeGiven) {
+                        Log.i(
+                            TAG,
+                            "the game reads the microphone directly, so this service is not " +
+                                "needed; parked and releasing the mic " +
+                                "(re-checking every ${PARKED_RECHECK_MS / 1000} s, quietly)"
+                        )
+                        parkNoticeGiven = true
+                    }
                     try {
                         link.close()
                     } catch (_: Exception) {
@@ -233,6 +244,7 @@ class VoiceCaptureService : Service() {
                 }
 
                 waitLogged = false
+                lastWaitLog = 0L
                 val stream = link.outputStream
                 Log.i(TAG, "connected to the voice socket")
 

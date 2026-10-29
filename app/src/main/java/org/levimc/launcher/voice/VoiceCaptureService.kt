@@ -8,48 +8,40 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.os.IBinder
 import android.util.Log
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
  * Voice Chat Levi - microphone capture, on the Java side of the launcher.
  *
- * 0.2.1 changes, all of them from the first device log:
+ * 0.2.2: the transport is an ABSTRACT UNIX DOMAIN SOCKET, not UDP loopback.
  *
- *  1. The socket is BOUND TO LOOPBACK explicitly. An unbound DatagramSocket
- *     rides the device's default network, so with no Wi-Fi/data (or through a
- *     VPN) sendto can fail even though the destination is 127.0.0.1. A socket
- *     bound to 127.0.0.1 never needs a default network.
- *  2. A send failure can no longer stop capture. Before, one exception fell into
- *     the catch, the loop exited and the recorder was released - which is why the
- *     log showed send errors and "capture stopped" together.
- *  3. The socket is recreated after repeated failures instead of being given up on.
- *  4. Explicit lines for every state change, so the next log answers the question
- *     instead of raising it:
- *        "capture started"
- *        "send failed: <class>: <message> (n)"
- *        "capture loop exited: <reason>"
- *        "capture heartbeat: n frames sent, m failed"
- *  5. START_STICKY, so the system restarts the service if it is killed.
+ * Why: 0.2.1 sent frames to 127.0.0.1:24456 with a socket explicitly bound to
+ * loopback, and the device still answered sendto with EPERM - repeatedly, even
+ * after the socket was rebuilt. That is Android's per-uid network filtering
+ * (netd): a socket belonging to an app with no matching network rule is refused
+ * even for loopback, because loopback still goes through the network stack.
+ * Rebuilding the socket cannot fix a rule that is applied per uid.
+ *
+ * A Unix domain socket never enters the network stack, so none of those rules
+ * apply. The abstract namespace (no filesystem path) also means there is nothing
+ * to clean up and no permission to set.
+ *
+ * Framing: one write per 20 ms frame, 320 samples of 16-bit PCM = 640 bytes. The
+ * native side reads exactly 640 bytes per frame.
  */
 class VoiceCaptureService : Service() {
 
     companion object {
         private const val TAG = "VoiceChatLevi"
-        private const val PORT = 24456
-        private const val HOST = "127.0.0.1"
+        private const val SOCKET_NAME = "org.levimc.voicechatlevi.audio"
         private const val SAMPLE_RATE = 16000
         private const val FRAME_SAMPLES = 320              // 20 ms at 16 kHz
-        private const val BYTES_PER_FRAME = FRAME_SAMPLES * 2
-        private const val FRAME_TAG = 0x56434C31           // "VCL1", little endian
+        private const val FRAME_BYTES = FRAME_SAMPLES * 2
+        private const val RECONNECT_MS = 500L
         private const val HEARTBEAT_FRAMES = 500           // 10 s of audio
-        private const val SOCKET_REBUILD_AFTER = 25        // consecutive send failures
 
         const val ACTION_START = "org.levimc.launcher.voice.START"
         const val ACTION_STOP = "org.levimc.launcher.voice.STOP"
@@ -123,19 +115,29 @@ class VoiceCaptureService : Service() {
         recorder = null
     }
 
-    /** A UDP socket that is pinned to loopback, so no default network is needed. */
-    private fun openLoopbackSocket(): DatagramSocket {
-        val socket = DatagramSocket(null)
-        socket.bind(InetSocketAddress(InetAddress.getByName(HOST), 0))
-        socket.broadcast = false
-        return socket
+    /** Connect to the native listener, retrying while it starts up. */
+    private fun connect(): LocalSocket? {
+        val socket = LocalSocket()
+        return try {
+            socket.connect(
+                LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT)
+            )
+            socket
+        } catch (error: Exception) {
+            Log.i(TAG, "unix socket not ready yet: ${error.javaClass.simpleName}: ${error.message}")
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
+            null
+        }
     }
 
     private fun captureLoop() {
         val minimum = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = maxOf(minimum, BYTES_PER_FRAME * 8)
+        val bufferSize = maxOf(minimum, FRAME_BYTES * 8)
         val record = try {
             AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -158,33 +160,36 @@ class VoiceCaptureService : Service() {
         }
 
         recorder = record
-        var socket: DatagramSocket? = null
-        val target = InetAddress.getByName(HOST)
-        val packet = ByteBuffer.allocate(BYTES_PER_FRAME + 4).order(ByteOrder.LITTLE_ENDIAN)
+        var socket: LocalSocket? = null
+        var stream: java.io.OutputStream? = null
         var sent = 0L
         var failed = 0L
-        var consecutiveFailures = 0
         var exitReason = "running flag cleared"
+        val frame = ByteArray(FRAME_BYTES)
 
         try {
-            socket = try {
-                openLoopbackSocket()
-            } catch (error: Exception) {
-                Log.e(TAG, "loopback socket failed: ${error.javaClass.simpleName}: ${error.message}")
-                running = false
-                return
-            }
-
             record.startRecording()
             Log.i(TAG, "capturing ${SAMPLE_RATE}Hz mono, ${FRAME_SAMPLES} samples per frame, " +
-                "sending to $HOST:$PORT, record state ${record.recordingState}")
+                "writing to abstract socket $SOCKET_NAME, record state ${record.recordingState}")
 
             while (running) {
-                packet.clear()
-                packet.putInt(FRAME_TAG)
+                // (Re)connect whenever the native side is not there. Capture keeps
+                // running meanwhile, so a restart of the listener costs no audio
+                // device churn.
+                if (socket == null) {
+                    val fresh = connect()
+                    if (fresh == null) {
+                        Thread.sleep(RECONNECT_MS)
+                        continue
+                    }
+                    socket = fresh
+                    stream = fresh.outputStream
+                    Log.i(TAG, "connected to the voice socket")
+                }
+
                 var read = 0
-                while (read < BYTES_PER_FRAME && running) {
-                    val count = record.read(packet.array(), 4 + read, BYTES_PER_FRAME - read)
+                while (read < FRAME_BYTES && running) {
+                    val count = record.read(frame, read, FRAME_BYTES - read)
                     if (count <= 0) {
                         if (count == AudioRecord.ERROR_DEAD_OBJECT ||
                             count == AudioRecord.ERROR_INVALID_OPERATION
@@ -196,42 +201,29 @@ class VoiceCaptureService : Service() {
                     }
                     read += count
                 }
-                if (read != BYTES_PER_FRAME) continue
+                if (read != FRAME_BYTES) continue
 
-                // A send is never allowed to end capture. Count it, complain at a
-                // sane rate, and rebuild the socket if it keeps failing.
-                val current = socket
                 try {
-                    if (current == null) throw IllegalStateException("socket is null")
-                    current.send(DatagramPacket(packet.array(), BYTES_PER_FRAME + 4, target, PORT))
-                    sent++
-                    consecutiveFailures = 0
-                    if (sent % HEARTBEAT_FRAMES == 0L) {
-                        Log.i(TAG, "capture heartbeat: $sent frames sent, $failed failed")
-                    }
+                    stream?.let {
+                        it.write(frame, 0, FRAME_BYTES)
+                        sent++
+                        if (sent % HEARTBEAT_FRAMES == 0L) {
+                            Log.i(TAG, "capture heartbeat: $sent frames sent, $failed failed")
+                        }
+                    } ?: throw IllegalStateException("no stream")
                 } catch (error: Exception) {
                     failed++
-                    consecutiveFailures++
-                    if (failed == 1L || consecutiveFailures % 10 == 0) {
-                        Log.w(
-                            TAG,
-                            "send failed: ${error.javaClass.simpleName}: ${error.message} " +
-                                "(total $failed, consecutive $consecutiveFailures)"
-                        )
+                    if (failed == 1L || failed % 100 == 0L) {
+                        Log.w(TAG, "write failed: ${error.javaClass.simpleName}: ${error.message} (total $failed)")
                     }
-                    if (consecutiveFailures >= SOCKET_REBUILD_AFTER) {
-                        try {
-                            socket?.close()
-                        } catch (_: Exception) {
-                        }
-                        socket = try {
-                            openLoopbackSocket()
-                        } catch (_: Exception) {
-                            null
-                        }
-                        consecutiveFailures = 0
-                        Log.i(TAG, "loopback socket rebuilt")
+                    // The listener went away: drop the socket and reconnect. This
+                    // never stops capture - that was the 0.2.0 bug.
+                    try {
+                        socket?.close()
+                    } catch (_: Exception) {
                     }
+                    socket = null
+                    stream = null
                 }
             }
         } catch (error: Throwable) {

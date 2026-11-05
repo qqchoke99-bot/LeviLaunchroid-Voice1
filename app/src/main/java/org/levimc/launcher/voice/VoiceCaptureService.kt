@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.IBinder
@@ -27,11 +29,10 @@ import android.util.Log
  *
  * 2. The mod now answers with an 8-byte handshake right after connecting:
  *        'V' 'C' 'L' 'S'   1   mode   0   0
- *    mode 0 = "send me audio", mode 1 = "this process already reads the
- *    microphone, stand down". On mode 1 the recorder is released - no battery,
- *    no fight over the microphone - and the service re-checks every 30 s in case
- *    the direct path dies later. An older library sends nothing; the read times
- *    out and the service behaves exactly as before.
+ *    mode 0 = "send audio with platform AEC", mode 1 = "the game reads the
+ *    microphone directly, stand down", mode 2 = "send audio without AEC".
+ *    On mode 1 the recorder is released; modes 0 and 2 stream PCM. An older
+ *    library that sends nothing times out and keeps the legacy capture behavior.
  *
  * Transport note: an abstract Unix domain socket, not UDP loopback. Android's
  * per-uid network filtering answered sendto with EPERM even for 127.0.0.1, and no
@@ -142,11 +143,14 @@ class VoiceCaptureService : Service() {
         null
     }
 
+    private data class ModRequest(val standDown: Boolean, val aecEnabled: Boolean)
+
     /**
-     * Read the mod's 8-byte greeting. Returns true when the mod says it does not
-     * need audio. A timeout or a short read means an older library, so false.
+     * Read the mod's 8-byte greeting. Legacy/unknown clients keep the existing
+     * capture behavior and request platform AEC by default.
      */
-    private fun isStandingDown(socket: LocalSocket): Boolean {
+    private fun readModRequest(socket: LocalSocket): ModRequest {
+        val legacyDefault = ModRequest(standDown = false, aecEnabled = true)
         return try {
             socket.soTimeout = 1500
             val input = socket.inputStream
@@ -160,16 +164,16 @@ class VoiceCaptureService : Service() {
             socket.soTimeout = 0
             if (read < 8 || hello[0] != 'V'.code.toByte() || hello[1] != 'C'.code.toByte() ||
                 hello[2] != 'L'.code.toByte() || hello[3] != 'S'.code.toByte()
-            ) {
-                return false
+            ) return legacyDefault
+
+            when (hello[5].toInt() and 0xff) {
+                1 -> ModRequest(standDown = true, aecEnabled = false)
+                2 -> ModRequest(standDown = false, aecEnabled = false)
+                else -> ModRequest(standDown = false, aecEnabled = true)
             }
-            hello[5].toInt() == 1
-        } catch (error: Exception) {
-            try {
-                socket.soTimeout = 0
-            } catch (_: Exception) {
-            }
-            false
+        } catch (_: Exception) {
+            try { socket.soTimeout = 0 } catch (_: Exception) {}
+            legacyDefault
         }
     }
 
@@ -224,8 +228,9 @@ class VoiceCaptureService : Service() {
                 }
                 val link = socket ?: break
 
-                // ---- 2. ask the mod whether it wants our audio ---------------
-                if (isStandingDown(link)) {
+                // ---- 2. ask the mod whether it wants audio and platform AEC --
+                val request = readModRequest(link)
+                if (request.standDown) {
                     if (!parkNoticeGiven) {
                         Log.i(
                             TAG,
@@ -246,7 +251,7 @@ class VoiceCaptureService : Service() {
                 waitLogged = false
                 lastWaitLog = 0L
                 val stream = link.outputStream
-                Log.i(TAG, "connected to the voice socket")
+                Log.i(TAG, "connected to the voice socket; platform AEC requested=${request.aecEnabled}")
 
                 // ---- 3. capture and write, releasing the recorder on the way out
                 val record = openRecorder(bufferSize)
@@ -261,8 +266,10 @@ class VoiceCaptureService : Service() {
                 }
                 recorder = record
                 val framesBefore = sent
+                var aec: AcousticEchoCanceler? = null
                 try {
                     record.startRecording()
+                    aec = attachPlatformAec(record.audioSessionId, request.aecEnabled)
                     Log.i(
                         TAG,
                         "capturing ${SAMPLE_RATE}Hz mono, $FRAME_SAMPLES samples per frame, " +
@@ -305,6 +312,7 @@ class VoiceCaptureService : Service() {
                         }
                     }
                 } finally {
+                    releasePlatformAec(aec)
                     try {
                         record.stop()
                     } catch (_: IllegalStateException) {
@@ -344,6 +352,44 @@ class VoiceCaptureService : Service() {
                 "capture loop exited: $exitReason ($sent sent, $failed failed, $exits link(s))"
             )
         }
+    }
+
+    /** Attach Android's best-effort AEC to this exact AudioRecord session. */
+    private fun attachPlatformAec(sessionId: Int, requested: Boolean): AcousticEchoCanceler? {
+        if (!requested) {
+            Log.i(TAG, "platform AEC disabled by the mod setting")
+            return null
+        }
+        if (!AcousticEchoCanceler.isAvailable()) {
+            Log.w(TAG, "platform AEC is not available on this device; continuing without it")
+            return null
+        }
+        return try {
+            val effect = AcousticEchoCanceler.create(sessionId)
+            if (effect == null) {
+                Log.w(TAG, "platform AEC could not attach to AudioRecord session $sessionId")
+                null
+            } else {
+                val status = effect.setEnabled(true)
+                val enabled = effect.enabled
+                Log.i(TAG, "platform AEC attach: session=$sessionId status=$status enabled=$enabled")
+                if (status != AudioEffect.SUCCESS || !enabled) {
+                    try { effect.release() } catch (_: Exception) {}
+                    null
+                } else {
+                    effect
+                }
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "platform AEC failed safely: ${error.javaClass.simpleName}: ${error.message}")
+            null
+        }
+    }
+
+    private fun releasePlatformAec(effect: AcousticEchoCanceler?) {
+        if (effect == null) return
+        try { effect.setEnabled(false) } catch (_: Exception) {}
+        try { effect.release() } catch (_: Exception) {}
     }
 
     private fun openRecorder(bufferSize: Int): AudioRecord? {

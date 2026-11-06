@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AudioEffect
+import android.media.audiofx.NoiseSuppressor
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.IBinder
@@ -143,14 +144,20 @@ class VoiceCaptureService : Service() {
         null
     }
 
-    private data class ModRequest(val standDown: Boolean, val aecEnabled: Boolean)
+    private data class ModRequest(
+        val standDown: Boolean,
+        val aecEnabled: Boolean,
+        val noiseSuppressionEnabled: Boolean
+    )
 
     /**
-     * Read the mod's 8-byte greeting. Legacy/unknown clients keep the existing
-     * capture behavior and request platform AEC by default.
+     * Read the mod's 8-byte greeting. Byte 5 keeps the legacy AEC/stand-down
+     * modes; byte 6 is a bit field (bit 0 requests platform NoiseSuppressor).
      */
     private fun readModRequest(socket: LocalSocket): ModRequest {
-        val legacyDefault = ModRequest(standDown = false, aecEnabled = true)
+        val legacyDefault = ModRequest(
+            standDown = false, aecEnabled = true, noiseSuppressionEnabled = false
+        )
         return try {
             socket.soTimeout = 1500
             val input = socket.inputStream
@@ -166,10 +173,11 @@ class VoiceCaptureService : Service() {
                 hello[2] != 'L'.code.toByte() || hello[3] != 'S'.code.toByte()
             ) return legacyDefault
 
+            val noiseSuppression = (hello[6].toInt() and 0x01) != 0
             when (hello[5].toInt() and 0xff) {
-                1 -> ModRequest(standDown = true, aecEnabled = false)
-                2 -> ModRequest(standDown = false, aecEnabled = false)
-                else -> ModRequest(standDown = false, aecEnabled = true)
+                1 -> ModRequest(standDown = true, aecEnabled = false, noiseSuppressionEnabled = false)
+                2 -> ModRequest(standDown = false, aecEnabled = false, noiseSuppressionEnabled = noiseSuppression)
+                else -> ModRequest(standDown = false, aecEnabled = true, noiseSuppressionEnabled = noiseSuppression)
             }
         } catch (_: Exception) {
             try { socket.soTimeout = 0 } catch (_: Exception) {}
@@ -251,7 +259,8 @@ class VoiceCaptureService : Service() {
                 waitLogged = false
                 lastWaitLog = 0L
                 val stream = link.outputStream
-                Log.i(TAG, "connected to the voice socket; platform AEC requested=${request.aecEnabled}")
+                Log.i(TAG, "connected to voice socket; platform AEC requested=${request.aecEnabled}, " +
+                    "platform NS requested=${request.noiseSuppressionEnabled}")
 
                 // ---- 3. capture and write, releasing the recorder on the way out
                 val record = openRecorder(bufferSize)
@@ -267,13 +276,17 @@ class VoiceCaptureService : Service() {
                 recorder = record
                 val framesBefore = sent
                 var aec: AcousticEchoCanceler? = null
+                var ns: NoiseSuppressor? = null
                 try {
                     record.startRecording()
                     aec = attachPlatformAec(record.audioSessionId, request.aecEnabled)
+                    ns = attachPlatformNoiseSuppressor(
+                        record.audioSessionId, request.noiseSuppressionEnabled
+                    )
                     Log.i(
                         TAG,
-                        "capturing ${SAMPLE_RATE}Hz mono, $FRAME_SAMPLES samples per frame, " +
-                            "writing to abstract socket $SOCKET_NAME"
+                        "capture effects: AEC=${aec?.enabled == true}, NS=${ns?.enabled == true}; " +
+                            "${SAMPLE_RATE}Hz mono, $FRAME_SAMPLES samples/frame -> $SOCKET_NAME"
                     )
                     while (running) {
                         var read = 0
@@ -312,6 +325,7 @@ class VoiceCaptureService : Service() {
                         }
                     }
                 } finally {
+                    releasePlatformNoiseSuppressor(ns)
                     releasePlatformAec(aec)
                     try {
                         record.stop()
@@ -387,6 +401,47 @@ class VoiceCaptureService : Service() {
     }
 
     private fun releasePlatformAec(effect: AcousticEchoCanceler?) {
+        if (effect == null) return
+        try { effect.setEnabled(false) } catch (_: Exception) {}
+        try { effect.release() } catch (_: Exception) {}
+    }
+
+    /** Attach Android's platform noise suppressor to this exact AudioRecord session. */
+    private fun attachPlatformNoiseSuppressor(
+        sessionId: Int,
+        requested: Boolean
+    ): NoiseSuppressor? {
+        if (!requested) {
+            Log.i(TAG, "platform NoiseSuppressor disabled by the mod setting")
+            return null
+        }
+        if (!NoiseSuppressor.isAvailable()) {
+            Log.w(TAG, "platform NoiseSuppressor is unavailable on this device")
+            return null
+        }
+        return try {
+            val effect = NoiseSuppressor.create(sessionId)
+            if (effect == null) {
+                Log.w(TAG, "platform NoiseSuppressor could not attach to AudioRecord session $sessionId")
+                null
+            } else {
+                val status = effect.setEnabled(true)
+                val enabled = effect.enabled
+                Log.i(TAG, "platform NS attach: session=$sessionId status=$status enabled=$enabled")
+                if (status != AudioEffect.SUCCESS || !enabled) {
+                    try { effect.release() } catch (_: Exception) {}
+                    null
+                } else {
+                    effect
+                }
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "platform NS failed safely: ${error.javaClass.simpleName}: ${error.message}")
+            null
+        }
+    }
+
+    private fun releasePlatformNoiseSuppressor(effect: NoiseSuppressor?) {
         if (effect == null) return
         try { effect.setEnabled(false) } catch (_: Exception) {}
         try { effect.release() } catch (_: Exception) {}
